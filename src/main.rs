@@ -18,12 +18,16 @@ struct Repo<'a> {
 
 impl<'a> Repo<'a> {
     fn set_remote(&self, name: &str, url: &str) -> Result<Remote> {
-        if let Ok(r) = self.repo.remote(name, url) {
-            Ok(r)
-        } else {
-            self.repo.remote_delete(name)?;
-            self.repo.remote(name, url)
+        if let Ok(r) = self.repo.find_remote(name) {
+            let old = r.url();
+            if old == Some(url) {
+                return Ok(r);
+            } else {
+                eprintln!("deleting remote {:?} ({})", old, name);
+                self.repo.remote_delete(name)?;
+            }
         }
+        self.repo.remote(name, url)
     }
 
     fn proxy_opts(&self) -> Option<ProxyOptions> {
@@ -34,12 +38,13 @@ impl<'a> Repo<'a> {
         })
     }
 
-    fn fetch_opts(&self) -> Option<FetchOptions> {
-        self.proxy_opts().map(|p| {
-            let mut r = FetchOptions::new();
+    fn fetch_opts(&self) -> FetchOptions {
+        let mut r = FetchOptions::new();
+        if let Some(p) = self.proxy_opts() {
             r.proxy_options(p);
-            r
-        })
+        }
+        r.prune(git2::FetchPrune::On);
+        r
     }
 
     fn push_opts(&self) -> Option<PushOptions> {
@@ -60,29 +65,26 @@ impl<'a> Repo<'a> {
     }
 
     fn do_fetch(&self, remote: &mut Remote) -> Result<HashMap<String, Oid>> {
-        let mut specs = Vec::new();
-        for s in remote.list()?.iter() {
-            let name = s.name();
-            if name.starts_with("refs/heads/") {
-                specs.push(name.to_string());
-            }
-        }
-        let mut res = HashMap::with_capacity(specs.len());
-        for spec in specs {
-            let mut opts = self.fetch_opts();
-            remote.fetch(&[&spec], opts.as_mut(), None)?;
-            match self.repo.find_reference("FETCH_HEAD") {
-                Ok(r) => {
-                    let oid = r.target().unwrap();
-                    let br = spec[11..].to_string();
-                    res.insert(br, oid);
-                }
-                Err(e) => {
-                    eprintln!("empty branch: {:?}", e);
-                    continue;
-                }
-            }
-        }
+        let mut opts = self.fetch_opts();
+        remote.fetch::<&str>(&[], Some(&mut opts), None)?;
+        drop(opts);
+        let ref_glob = format!("refs/remotes/{}/*", remote.name().unwrap());
+        let ref_prefix = &ref_glob[..ref_glob.len() - 1];
+        let res = self
+            .repo
+            .references_glob(&ref_glob)?
+            .map(|r| {
+                let r = r.unwrap();
+                (
+                    r.name()
+                        .unwrap()
+                        .strip_prefix(ref_prefix)
+                        .unwrap()
+                        .to_string(),
+                    r.target().unwrap(),
+                )
+            })
+            .collect::<HashMap<String, Oid>>();
         if res.is_empty() {
             return Err(Error::from_str("empty remote"));
         }
@@ -95,8 +97,10 @@ fn merge(repo: &Repository, branch: &str, oid: Option<Oid>) -> Result<Option<Oid
     match repo.find_reference(&ref_name) {
         Ok(mut r) => {
             let old = r.target().unwrap();
-            if let Some(oid) = oid {
-                r.set_target(oid, "mirror update")?;
+            if let Some(new) = oid {
+                if old != new {
+                    r.set_target(new, "mirror update")?;
+                }
             } else {
                 r.delete()?;
             }
@@ -237,26 +241,19 @@ fn work(path: &str, a_url: &str, b_url: &str, proxy: Option<&str>, debug: bool) 
                         *st = RefUpdate::Both;
                     } else if b_now == *old {
                         cnt_a += 1;
-                    } else if let Some(a_now) = *now {
-                        if let Some(b_now) = b_now {
-                            if repo.graph_descendant_of(a_now, b_now)? {
-                                eprintln!("{}@{}:{} ff to A", path, br, a_now);
-                                cnt_a += 1;
-                            } else if repo.graph_descendant_of(b_now, a_now)? {
-                                eprintln!("{}@{}:{} ff to B", path, br, b_now);
-                                *now = Some(b_now);
-                                *st = RefUpdate::B;
-                                cnt_b += 1;
-                            } else {
-                                if let Ok((ahead, behind)) = repo.graph_ahead_behind(b_now, a_now) {
-                                    eprintln!(
-                                        "{}@{}: {} ahead, {} behind",
-                                        path, br, ahead, behind
-                                    );
-                                }
-                                *st = RefUpdate::Conflict;
-                            }
+                    } else if let (Some(a_now), Some(b_now)) = (*now, b_now) {
+                        if repo.graph_descendant_of(a_now, b_now)? {
+                            eprintln!("{}@{}:{} ff to A", path, br, a_now);
+                            cnt_a += 1;
+                        } else if repo.graph_descendant_of(b_now, a_now)? {
+                            eprintln!("{}@{}:{} ff to B", path, br, b_now);
+                            *now = Some(b_now);
+                            *st = RefUpdate::B;
+                            cnt_b += 1;
                         } else {
+                            if let Ok((ahead, behind)) = repo.graph_ahead_behind(b_now, a_now) {
+                                eprintln!("{}@{}: {} ahead, {} behind", path, br, ahead, behind);
+                            }
                             *st = RefUpdate::Conflict;
                         }
                     } else {
