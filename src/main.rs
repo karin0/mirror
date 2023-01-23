@@ -346,6 +346,7 @@ struct Conf {
     hosts: Option<HashMap<String, String>>,
     bind: Option<String>,
     debug: Option<bool>,
+    delay: Option<u32>,
 }
 
 impl Conf {
@@ -418,6 +419,16 @@ impl Req {
     }
 }
 
+fn worker(app: &Mutex<App>, debug: bool) {
+    let app = app.lock().unwrap();
+    let (repos, proxy) = app.deref();
+    for (path, (url_a, url_b)) in repos {
+        if let Err(e) = work(path, url_a, url_b, proxy.as_deref(), debug) {
+            eprintln!("{}: {}", path, e);
+        }
+    }
+}
+
 fn main() -> AnyResult<()> {
     let conf = Conf::read()?;
     let hosts = conf.hosts;
@@ -440,20 +451,21 @@ fn main() -> AnyResult<()> {
     }
     drop(hosts);
     let debug = conf.debug.unwrap_or(false);
+    let delay = conf.delay.unwrap_or(0);
 
     let arc = Arc::new(Mutex::new((repos, conf.proxy)));
-    let app = arc.clone();
-    let worker = thread::spawn(move || loop {
-        let app = app.lock().unwrap();
-        let (repos, proxy) = app.deref();
-        for (path, (url_a, url_b)) in repos {
-            if let Err(e) = work(path, url_a, url_b, proxy.as_deref(), debug) {
-                eprintln!("{}: {}", path, e);
-            }
-        }
-        drop(app);
-        thread::sleep(Duration::from_secs(60));
-    });
+    let handle = if delay > 0 {
+        let dur = Duration::from_secs(delay as u64);
+        let app = arc.clone();
+        Some(thread::spawn(move || loop {
+            worker(&app, debug);
+            thread::sleep(dur);
+        }))
+    } else {
+        worker(&arc, debug);
+        None
+    };
+
     if let Some(addr) = conf.bind {
         let server = if let Some(unix) = addr.strip_prefix("unix:") {
             Server::http_unix(unix.as_ref())
@@ -463,10 +475,10 @@ fn main() -> AnyResult<()> {
         .unwrap();
         eprintln!("Listening on {:?}", server.server_addr());
         for request in server.incoming_requests() {
-            Req(request).handle(arc.deref(), debug);
+            Req(request).handle(&arc, debug);
         }
-    } else {
-        worker.join().unwrap();
+    } else if let Some(handle) = handle {
+        handle.join().unwrap();
     }
     Ok(())
 }
