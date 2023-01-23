@@ -94,13 +94,13 @@ fn merge(repo: &Repository, branch: &str, oid: Option<Oid>) -> Result<Option<Oid
     let ref_name = format!("refs/heads/{}", branch);
     match repo.find_reference(&ref_name) {
         Ok(mut r) => {
-            let old = r.target();
+            let old = r.target().unwrap();
             if let Some(oid) = oid {
                 r.set_target(oid, "mirror update")?;
             } else {
                 r.delete()?;
             }
-            Ok(old)
+            Ok(Some(old))
         }
         Err(_) => {
             if let Some(oid) = oid {
@@ -320,19 +320,21 @@ fn work(path: &str, a_url: &str, b_url: &str, proxy: Option<&str>, debug: bool) 
     }
     assert_eq!(to_b.len(), cnt_a);
     assert_eq!(to_a.len(), cnt_b);
-    let mut opts = ctx.push_opts();
-    let mut push =
-        |specs: Vec<String>, mut remote: Remote, raw: HashMap<String, Oid>| -> Result<()> {
-            if !specs.is_empty() {
-                if ctx.fetch(&mut remote)? != raw {
-                    return Err(Error::from_str("remote changed"));
-                }
-                remote.push(&specs, opts.as_mut())?;
-            }
-            Ok(())
-        };
-    push(to_a, remote_a, a_raw)?;
-    push(to_b, remote_b, b_raw)?;
+    if !to_a.is_empty() || !to_b.is_empty() {
+        if ctx.fetch(&mut remote_a)? != a_raw {
+            return Err(Error::from_str("remote A changed"));
+        }
+        if ctx.fetch(&mut remote_b)? != b_raw {
+            return Err(Error::from_str("remote B changed"));
+        }
+        let mut opts = ctx.push_opts();
+        if !to_a.is_empty() {
+            remote_a.push(&to_a, opts.as_mut())?;
+        }
+        if !to_b.is_empty() {
+            remote_b.push(&to_b, opts.as_mut())?;
+        }
+    }
     old_refs.close();
     Ok(())
 }
@@ -453,15 +455,15 @@ fn main() -> AnyResult<()> {
         thread::sleep(Duration::from_secs(60));
     });
     if let Some(addr) = conf.bind {
-        let app = arc;
         let server = if let Some(unix) = addr.strip_prefix("unix:") {
-            Server::http_unix(unix.as_ref()).unwrap()
+            Server::http_unix(unix.as_ref())
         } else {
-            Server::http(addr).unwrap()
-        };
+            Server::http(addr)
+        }
+        .unwrap();
         eprintln!("Listening on {:?}", server.server_addr());
         for request in server.incoming_requests() {
-            Req(request).handle(app.deref(), debug);
+            Req(request).handle(arc.deref(), debug);
         }
     } else {
         worker.join().unwrap();
