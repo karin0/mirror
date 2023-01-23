@@ -1,0 +1,14 @@
+[package]
+name = "mirror"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+git2 = "0"
+serde_yaml = "0"
+serde = { version = "1", features = ["derive"] }
+tiny_http = "0"
+
+[profile.release]
+lto = true
+strip = true
