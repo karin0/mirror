@@ -1,11 +1,12 @@
 use git2::{BranchType, Error, FetchOptions, Oid, ProxyOptions, PushOptions, Remote, Repository};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::Read;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{fmt, thread};
-use tiny_http::{Response, Server};
+use tiny_http::{Request, Response, Server};
 
 type Result<T> = std::result::Result<T, Error>;
 type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -353,6 +354,68 @@ impl Conf {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct PayloadRepository {
+    name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Payload {
+    repository: PayloadRepository,
+}
+
+type App = (HashMap<String, (String, String)>, Option<String>);
+
+struct Req(Request);
+impl Req {
+    fn end<T: Read>(self, r: Response<T>) {
+        if let Err(e) = self.0.respond(r) {
+            eprintln!("respond: {}", e);
+        }
+    }
+
+    fn end_400(self, msg: &str) {
+        eprintln!("{} {}: {}", self.0.method(), self.0.url(), msg);
+        self.end(Response::from_data(msg).with_status_code(400))
+    }
+
+    fn handle(mut self, app: &Mutex<App>, debug: bool) {
+        let mut path = self.0.url()[1..].to_string();
+        if path.is_empty() {
+            if self.0.headers().iter().any(|header| {
+                header.field.equiv("content-type") && header.value == "application/json"
+            }) {
+                match serde_json::from_reader::<_, Payload>(self.0.as_reader()) {
+                    Ok(v) => {
+                        path = v.repository.name;
+                        eprintln!("{} {}: resolved to {}", self.0.method(), self.0.url(), path);
+                    }
+                    Err(_) => {
+                        return self.end_400("json");
+                    }
+                }
+            } else {
+                return self.end_400("no repo");
+            }
+        } else {
+            eprintln!("{} {}: requesting {}", self.0.method(), self.0.url(), path);
+        }
+        let app = app.lock().unwrap();
+        let (repos, proxy) = app.deref();
+        if let Some((url_a, url_b)) = repos.get(&path) {
+            if let Err(e) = work(&path, url_a, url_b, proxy.as_deref(), debug) {
+                eprintln!("{}: error: {}", path, e);
+            } else {
+                eprintln!("{}: ok", path);
+            }
+        } else {
+            eprintln!("{}: not found", path);
+        }
+        drop(app);
+        self.end(Response::from_data("ok"))
+    }
+}
+
 fn main() -> AnyResult<()> {
     let conf = Conf::read()?;
     let hosts = conf.hosts;
@@ -398,29 +461,7 @@ fn main() -> AnyResult<()> {
         };
         eprintln!("Listening on {:?}", server.server_addr());
         for request in server.incoming_requests() {
-            let method = request.method();
-            let url = request.url();
-            if debug {
-                for header in request.headers() {
-                    eprintln!("{} {}: {:?}", method, url, header);
-                }
-            }
-            let path = &url[1..];
-            let app = app.lock().unwrap();
-            let (repos, proxy) = app.deref();
-            if let Some((url_a, url_b)) = repos.get(path) {
-                if let Err(e) = work(path, url_a, url_b, proxy.as_deref(), debug) {
-                    eprintln!("{} {}: {}", method, url, e);
-                } else {
-                    eprintln!("{} {}: ok", method, url);
-                }
-            } else {
-                eprintln!("{} {}: not found", method, url);
-            }
-            drop(app);
-            if let Err(e) = request.respond(Response::from_data("ok")) {
-                eprintln!("respond: {}", e);
-            }
+            Req(request).handle(app.deref(), debug);
         }
     } else {
         worker.join().unwrap();
